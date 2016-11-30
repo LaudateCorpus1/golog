@@ -89,6 +89,10 @@ func New(level Level) (l *Logger) {
 	return
 }
 
+func (l *Logger) Print(logMsg string) {
+	queueMsgDirect(logMsg)
+}
+
 func (l *Logger) Printf(level Level, prefix, format string, v ...interface{}) {
 	switch {
 	case level == Levels.Access:
@@ -133,4 +137,8 @@ func (l *Logger) Level() Level {
 
 func (l *Logger) SetAccessLogSample(sample uint64) {
 	atomic.StoreUint64(&l.sample, sample)
+}
+
+func (l *Logger) Close() {
+	drainTheQueue()
 }

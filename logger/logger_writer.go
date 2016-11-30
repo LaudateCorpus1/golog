@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 )
@@ -34,6 +35,7 @@ var (
 	ErrLogFullBuf           = errors.New("Log message queue is full")
 	ErrFreeMessageOverflow  = errors.New("Too many free messages. Overflow of fixed	set.")
 	ErrFreeMessageUnderflow = errors.New("Too few free messages. Underflow of fixed	set.")
+	ErrUnavailable          = errors.New("Log system is shut down.")
 
 	// the logName object for syslog to use
 	logName *C.char
@@ -66,7 +68,10 @@ var (
 		Levels.Debug:  []byte("[Debug] "),
 	}
 
-	customSock net.Conn = nil
+	customSock      net.Conn = nil
+	shuttingDownMux sync.RWMutex
+	shuttingDown    bool
+	wg              sync.WaitGroup
 )
 
 // When called, this will switch over to writting log messages to the defined socket.
@@ -102,57 +107,65 @@ func freeMsg(msg *logMessage) (err error) {
 	return
 }
 
-// queueMsg adds a message to the pending messages channel. It will drop the
+// queueMsgDirect adds a message to the pending messages channel. It will drop the
 // message and return an error if the channel is full.
-func queueMsg(lvl Level, prefix, format string, v ...interface{}) (err error) {
-	atomic.AddUint64(&logCount, 1)
+func queueMsgDirect(logEntry string) (err error) {
 
-	var msg *logMessage
+	shuttingDownMux.RLock()
+	defer shuttingDownMux.RUnlock()
 
-	// get a message if possible
-	select {
-	case msg = <-freeMessages:
-		defer func() {
-			if err != nil {
-				freeMsg(msg)
-			}
-		}()
-	default:
-		// no messages left, drop
-		atomic.AddUint64(&dropCount, 1)
-		return
-	}
+	if !shuttingDown {
 
-	// render the message: level prefix, message body, C null terminator
-	msg.level = levelSysLog[lvl]
-	if msg.Write(levelMapFmt[lvl]); err != nil {
-		atomic.AddUint64(&errCount, 1)
-		return
-	}
-	if fmt.Fprintf(msg, "%s", prefix); err != nil {
-		atomic.AddUint64(&errCount, 1)
-		return
-	}
-	if _, err = fmt.Fprintf(msg, format, v...); err != nil {
-		atomic.AddUint64(&errCount, 1)
-		return
-	}
-	if msg.WriteByte(0); err != nil {
-		atomic.AddUint64(&errCount, 1)
-		return
-	}
+		atomic.AddUint64(&logCount, 1)
 
-	// queue the message
-	select {
-	case messages <- msg:
-		// no-op
-	default:
-		// this should never happen since there is an exact number of messages
-		atomic.AddUint64(&errCount, 1)
-		return ErrLogFullBuf
+		var msg *logMessage
+
+		// get a message if possible
+		select {
+		case msg = <-freeMessages:
+			defer func() {
+				if err != nil {
+					freeMsg(msg)
+				}
+			}()
+		default:
+			// no messages left, drop
+			atomic.AddUint64(&dropCount, 1)
+			return
+		}
+
+		// render the message: level prefix, message body, C null terminator
+		msg.level = levelSysLog[Levels.Debug]
+		if msg.Write([]byte(logEntry)); err != nil {
+			atomic.AddUint64(&errCount, 1)
+			return
+		}
+		if msg.WriteByte(0); err != nil {
+			atomic.AddUint64(&errCount, 1)
+			return
+		}
+
+		// queue the message
+		select {
+		case messages <- msg:
+			// no-op
+		default:
+			// this should never happen since there is an exact number of messages
+			atomic.AddUint64(&errCount, 1)
+			return ErrLogFullBuf
+		}
+	} else {
+		return ErrUnavailable
 	}
 
 	return
+}
+
+// queueMsg adds a message to the pending messages channel. It will drop the
+// message and return an error if the channel is full.
+func queueMsg(lvl Level, prefix, format string, v ...interface{}) (err error) {
+	logMsg := fmt.Sprintf("%s %s %s", levelMapFmt[lvl], prefix, fmt.Sprintf(format, v...))
+	return queueMsgDirect(logMsg)
 }
 
 // write a message to syslog. This is a concrete, blocking event.
@@ -199,5 +212,25 @@ func init() {
 		}
 	}
 
-	go logWriter()
+	wg.Add(1)
+	go func() {
+		logWriter()
+		wg.Done()
+	}()
+}
+
+// closing up shop - flush the queue
+func drainTheQueue() {
+	// exclusively acquire the mux
+	shuttingDownMux.Lock()
+	// set the flag
+	shuttingDown = true
+	// close the channel
+	close(messages)
+	// release the mux
+	shuttingDownMux.Unlock()
+
+	// wait for logwriter to close
+	wg.Wait()
+
 }
