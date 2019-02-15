@@ -22,7 +22,8 @@ import (
 import "C"
 
 const (
-	NumMessages = 10 * 1024 // number of allowed log messages
+	NumMessages    = 10 * 1024 // number of allowed log messages
+	MaxFreeMsgSize = 8 * 1024  // maximum size of a free pooled msg
 )
 
 // container for a pending log message
@@ -196,7 +197,12 @@ func logWriter() {
 		} else {
 			writeCustomSocket(msg)
 		}
-		msg.Reset()
+
+		if msg.Cap() > MaxFreeMsgSize {
+			*msg = logMessage{}
+		} else {
+			msg.Reset()
+		}
 		freeMsg(msg)
 	}
 	if customSock != nil {
